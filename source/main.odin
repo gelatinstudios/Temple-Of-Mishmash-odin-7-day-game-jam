@@ -2,9 +2,11 @@
 package odin_7_day_jam
 
 import "core:fmt"
+import "core:slice"
 import "core:math"
 import "core:math/rand"
 import "core:math/linalg"
+import sa "core:container/small_array"
 import ba "core:container/bit_array"
 
 import rl "vendor:raylib"
@@ -12,9 +14,9 @@ import rl "vendor:raylib"
 DEV :: true
 
 main :: proc() {
-    window_width  :: 1280
-    window_height :: 720
-    rl.InitWindow(window_width, window_height, "MotherBored")
+    window_width  :: 640
+    window_height :: 480
+    rl.InitWindow(window_width, window_height, "THE TEMPLE OF MISHMASH")
 
     @static game: Game
     g := &game
@@ -43,22 +45,25 @@ load_texture :: proc($path: string) -> rl.Texture {
     return tex
 }
 
-
-
 Game :: struct {
+    canon_path_indices: sa.Small_Array(Maze_Cell_Array_Size, int),
     maze: Maze,
+
+    state: Game_State,
+
     window_dims: [2]int,
+    level: Level,
+
+    segment_walls: [Segment_Count]int,
 
     player: Vector2,
     player_dir: Vector2,
     camera_plane: f32,
     fov: f32, // in degrees
 
-    // TODO: index instead of pointer?
-    player_cell: ^Cell,
-    goal: ^Cell,
+    player_keys: bit_set[Door_Color],
 
-    var_cells: []i32,
+    player_cell_index: int, // index
 
     wall_texture: rl.Texture,
 
@@ -67,61 +72,188 @@ Game :: struct {
     zoom_2d: f32,
 }
 
-game_init :: proc(g: ^Game, window_width, window_height: int) {
-    maze_init(&g.maze)
+Game_State :: enum {
+    Intro = 0,
+    Playing,
+    Win,
+}
 
-    player_coords := [2]int {g.maze.dims.x/2, 1}
-    {
-        for &c in g.maze.cells {
-            c = .Wall
-        }
-        p := player_coords
+Win_Door_Color :: Door_Color.Yellow
 
-        for p.y < g.maze.dims.y - 2 {
-            maze_cell_ptr(&g.maze, p.x, p.y)^ = .Empty
-            dp_choices: [][2]int
-            if p.x == 1 {
-                dp_choices = {{0, 1}, {1, 0}}
-            } else if p.x == g.maze.dims.x - 2 {
-                dp_choices = {{0, 1}, {-1, 0}}
-            } else {
-                dp_choices = {{0, 1}, {-1, 0}, {1, 0}}
-            }
-            p += rand.choice(dp_choices)
-        }
-        g.goal = maze_cell_ptr(&g.maze, p.x, p.y)
-        g.goal^ = .Empty
+Trap :: enum u8 { } // TODO
 
-        var_cells: [dynamic]i32
-        for y in 1 ..< g.maze.dims.y-1 {
-            for x in 1 ..< g.maze.dims.x-1 {
-                if maze_cell(&g.maze, x, y) == .Wall {
-                    index := x + y * g.maze.dims.x
-                    append(&var_cells, i32(index))
-                }
-            }
-        }
-        g.var_cells = var_cells[:]
+Door_Color :: enum u8 { Red, Yellow, Black, White }
+door_rl_color :: proc(d: Door_Color) -> rl.Color {
+    switch d {
+        case .Red: return rl.RED
+        case .Yellow: return rl.YELLOW
+        case .Black: return rl.BLACK
+        case .White: return rl.WHITE
     }
+    return rl.PINK
+}
 
+Segment_Count :: 4
 
-    cell_dims := to_Vector2(g.maze.cell_dims)
+Level :: enum { Normal, Randomize, Idol }
 
-    g.window_dims = {window_width, window_height}
-    g.player = to_Vector2(player_coords) * cell_dims + cell_dims*.5
-    g.player_dir = {0, 1}
-    g.camera_plane = 25
-    g.fov = 55
+Player_Spawn :: [2]int {Maze_Width/2, 1}
 
-    g.player_cell = maze_cell_ptr(&g.maze, player_coords.x, player_coords.y)
+game_init :: proc(g: ^Game, window_width, window_height: int) {
+    m := &g.maze
+
+    game_reset(g)
 
     g.wall_texture = load_texture("../assets/circuit.png")
 
+    g.window_dims = {window_width, window_height}
+    g.camera_plane = 25
+    g.fov = 55
     g.zoom_2d = 1
 }
 
+game_reset :: proc(g: ^Game) {
+    m := &g.maze
+
+    m.cells = {}
+    m.cell_dims = {50, 50}
+    cell_dims := to_Vector2(m.cell_dims)
+    m.dims.x = Maze_Width
+    m.dims.y = 0
+    for &s in g.segment_walls {
+        n := rand_int_range(Min_Segment_Len, Max_Segment_Len)
+        m.dims.y += n
+        s = m.dims.y
+    }
+    m.dims.y += 1
+
+    // choose y positions for keys
+    key_y_positions: [Segment_Count]int
+    for &y, i in key_y_positions {
+        for {
+            seg_wall := g.segment_walls[i]
+            n := rand_int_range(1, seg_wall-1)
+            if !slice.contains(g.segment_walls[:], n) && 
+               !slice.contains(key_y_positions[:], n)
+            {
+                y = n
+                break
+            }
+        }
+    }
+
+    // create path to each door
+    rand_step :: proc(m: ^Maze, p: [2]int) -> [2]int {
+        dp_choices: [][2]int
+        if p.x == 1 {
+            dp_choices = {{0, 1}, {1, 0}}
+        } else if p.x == m.dims.x - 2 {
+            dp_choices = {{0, 1}, {-1, 0}}
+        } else {
+            dp_choices = {{0, 1}, {-1, 0}, {1, 0}}
+        }
+        return rand.choice(dp_choices)
+    }
+    rand_path :: proc(m: ^Maze, start: [2]int, stop_y: int) {
+        e := start
+        for e.y < stop_y {
+            maze_cell_ptr(m, e).open = true
+            e += rand_step(m, e)
+        }
+    }
+
+    door_keys: [Segment_Count]int
+    
+    sa.clear(&g.canon_path_indices)
+
+    p := Player_Spawn
+    for seg_wall, i in g.segment_walls {
+        for p.y < seg_wall {
+            // extra paths
+            if p.x < m.dims.x-3 && rand.float64() < 0.01 {
+                maze_cell_ptr(m, p + {1, 0}).open = true
+                rand_path(m, p + {2, 0}, seg_wall-1)
+            }
+            if p.x > 3          && rand.float64() < 0.01 {
+                maze_cell_ptr(m, p - {1, 0}).open = true
+                rand_path(m, p - {2, 0}, seg_wall-1)
+            }
+
+            index := maze_cell_index(m, p)
+
+            // canon path
+            maze_cell_ptr(m, p).open = true
+            sa.append(&g.canon_path_indices, index)
+
+            p += rand_step(m, p)
+            for k, i in key_y_positions {
+                if p.y == k {
+                    door_keys[i] = index
+                }
+            }
+        }
+        cell := maze_cell_ptr(m, p)
+        cell.is_door = true
+        cell.color   = Door_Color(i)
+        p.y += 1
+    }
+
+    // set door key cells
+    for index, color_index in door_keys {
+        if index == 0 {
+            game_reset(g) // awful hack absolutely awful
+        }
+        m.cells[index].has_key = true
+        m.cells[index].color = Door_Color(color_index)
+    }
+
+    g.player = to_Vector2(Player_Spawn) * cell_dims + cell_dims*.5
+    g.player_dir = {0, 1}
+
+    g.player_cell_index = maze_cell_index(m, Player_Spawn)
+}
+
+game_reset_idol :: proc(g: ^Game) {
+    m := &g.maze
+
+    m.cells = {}
+    m.cell_dims = {50, 50}
+    cell_dims := to_Vector2(m.cell_dims)
+    m.dims.x = Maze_Width
+    m.dims.y = 10
+
+    g.player = to_Vector2(Player_Spawn) * cell_dims + cell_dims*.5
+    g.player_dir = {0, 1}
+
+    g.player_cell_index = maze_cell_index(m, Player_Spawn)
+
+    for y in 1 ..< m.dims.y-2 {
+        for x in 1 ..< m.dims.x-2 {
+            maze_cell_ptr(m, {x, y}).open = true
+        }
+    }
+
+    maze_cell_ptr(m, {Maze_Width/2, 0}).is_door = true
+    maze_cell_ptr(m, {Maze_Width/2, 0}).color = Win_Door_Color
+
+    maze_cell_ptr(m, {Maze_Width/2, m.dims.y-3}).has_key = true
+    maze_cell_ptr(m, {Maze_Width/2, m.dims.y-3}).color = Win_Door_Color
+}
+
 game_update :: proc(g: ^Game) {
+    switch g.state {
+        case .Intro:
+            if rl.IsKeyPressed(.ENTER) {
+                g.state = .Playing
+            }
+        case .Playing: game_update_playing(g)
+        case .Win:
+    }
+}
+
+game_update_playing :: proc(g: ^Game) {
     dt := rl.GetFrameTime()
+    m := &g.maze
 
     moving := false
 
@@ -146,9 +278,37 @@ game_update :: proc(g: ^Game) {
     if rl.IsKeyDown(.DOWN) {
         new_pos = g.player - g.player_dir * dt * dp
     }
-    if maze_cell_pos(&g.maze, new_pos) == .Empty {
+    next_cell := maze_cell_pos_ptr(m, new_pos)
+    if next_cell.open {
         moving = true
         g.player = new_pos
+    } else if next_cell.is_door && next_cell.color in g.player_keys {
+        if next_cell.color == .White { // Reached White Door
+            switch g.level {
+                case .Normal:
+                    game_reset(g)
+                    g.level = .Randomize
+                    return
+                case .Randomize:
+                    game_reset_idol(g)
+                    g.level = .Idol
+                case .Idol: unreachable()
+            }
+        } else if next_cell.color == Win_Door_Color && g.level == .Idol {
+            g.state = .Win
+            return
+        } else {
+            moving = true
+            g.player.x = new_pos.x
+            c := maze_cell_coords(m, new_pos)
+            h := f32(m.cell_dims.y)
+            cell_center_y := f32(c.y) * h + h/2
+            if new_pos.y < cell_center_y {
+                g.player.y = f32(c.y + 1) * h + 1
+            } else {
+                g.player.y = f32(c.y + 0) * h - 1
+            }
+        }
     }
 
     when DEV {
@@ -156,50 +316,79 @@ game_update :: proc(g: ^Game) {
             g.draw_2d = !g.draw_2d
         }
 
+        if rl.IsKeyPressed(.L) {
+            game_reset(g)
+            g.level = .Randomize
+        }
+
+        if rl.IsKeyPressed(.I) {
+            game_reset_idol(g)
+            g.level = .Idol
+        }
+
         if g.draw_2d {
             g.zoom_2d += rl.GetMouseWheelMove() * 0.05
         }
     }
 
-    g.player_cell = maze_cell_pos_ptr(&g.maze, g.player)
-    g.player_cell^ = .Empty
+    g.player_cell_index = maze_cell_pos_index(m, g.player)
 
-    if moving {
-        ignore := make(map[i32]struct{}, context.temp_allocator)
+    player_cell := &m.cells[g.player_cell_index]
+
+    if player_cell.has_key {
+        player_cell.has_key = false
+        g.player_keys += {player_cell.color}
+    }
+
+    if moving && g.level == .Randomize {
+        ignore := make(map[int]struct{}, context.temp_allocator)
+
+        for index in sa.slice(&g.canon_path_indices) {
+            ignore[index] = {}
+        }
 
         r := make_raycaster(g)
         for a in raycast_iter(&r) {
             p := g.player
-            for maze_cell_pos(&g.maze, p) == .Empty {
+            for maze_cell_pos(m, p).open {
                 p += a
-                cell := maze_cell_coords(&g.maze, p)
-                index := cell.x + cell.y * g.maze.dims.x
-                ignore[i32(index)] = {}
+                cell := maze_cell_coords(m, p)
+                ignore[maze_cell_index(m, cell)] = {}
             }
-            cell := maze_cell_coords(&g.maze, p)
-            index := cell.x + cell.y * g.maze.dims.x
-            ignore[i32(index)] = {}
+            cell := maze_cell_coords(m, p)
+            ignore[maze_cell_index(m, cell)] = {}
         }
 
-        player_cell := maze_cell_coords(&g.maze, g.player)
+        player_cell := maze_cell_coords(m, g.player)
         for dy in -1..=1 {
-            for dx in -1..=-1 {
-                x := player_cell.x + dx
-                y := player_cell.y + dy
-                index := x + y * g.maze.dims.x
-                ignore[i32(index)] = {}
+            for dx in -1..=1 {
+                p := player_cell + {dx, dy}
+                if maze_cell_ptr(m, p) != nil {
+                    ignore[maze_cell_index(m, p)] = {}
+                }
             }
         }
 
-        for i in g.var_cells {
-            if i not_in ignore {
-                g.maze.cells[i] = rand.choice_enum(Cell)
+        start_y := 1
+        end_y := 2
+        for y in g.segment_walls {
+            if y > player_cell.y {
+                end_y = y - 1
+                break
+            }
+            start_y = y + 1
+        }
+
+        start_x := 1
+        end_x := m.dims.x-2
+        for y in start_y..=end_y {
+            for x in start_x..=end_x {
+                index := maze_cell_index(m, {x, y})
+                if index not_in ignore {
+                    m.cells[index].open = rand.float64() < .3
+                }
             }
         }
-    }
-
-    if g.player_cell == g.goal {
-        fmt.println("YOU WIN!")
     }
 }
 
@@ -209,10 +398,26 @@ game_draw :: proc(g: ^Game) {
     } else {
         game_draw_raycast(g)
     }
+
+    if g.state == .Intro {
+        draw_text(g, "Welcome to THE TEMPLE OF MISHMASH", 
+                     "Use Arrow Keys To Move",
+                     "Press Enter To Begin")
+    }
+
+    if g.state == .Win {
+        draw_text(g, "Congratulations!", 
+                     "You found the idol and made it out",
+                     "Let's hope this ends up in a museum!")
+    }
 }
 
 game_draw_2d :: proc(g: ^Game) {
-    cell_dims := to_Vector2(g.maze.cell_dims)
+    m := &g.maze
+
+    rl.ClearBackground(rl.GRAY)
+
+    cell_dims := to_Vector2(m.cell_dims)
 
     camera: rl.Camera2D
     camera.target = g.player
@@ -223,22 +428,41 @@ game_draw_2d :: proc(g: ^Game) {
     rl.BeginMode2D(camera)
     defer rl.EndMode2D()
 
-    player_cell := maze_cell_pos_ptr(&g.maze, g.player)
+    player_cell := maze_cell_pos_ptr(m, g.player)
 
-    for cell_y in 0 ..< g.maze.dims.y {
-        for cell_x in 0 ..< g.maze.dims.x {
-            p := to_Vector2({cell_x, cell_y}) * cell_dims
-            cell := maze_cell_ptr(&g.maze, cell_x, cell_y)
-            if cell^ == .Empty {
-                if cell == g.goal {
-                    rl.DrawRectangleV(p, cell_dims, rl.PURPLE)
-                }
+    start := g.player - (to_Vector2(g.window_dims) + cell_dims)
+    end   := g.player + (to_Vector2(g.window_dims) + cell_dims)
+
+    start_cell := maze_cell_coords(m, start)
+    end_cell   := maze_cell_coords(m, end)
+
+    start_cell.x = max(start_cell.x, 0)
+    start_cell.y = max(start_cell.y, 0)
+    end_cell.x = min(end_cell.x, m.dims.x-1)
+    end_cell.y = min(end_cell.y, m.dims.y-1)
+
+    for cell_y in start_cell.y ..= end_cell.y {
+        for cell_x in start_cell.x ..= end_cell.x {
+            p := [2]int {cell_x, cell_y}
+            pos := to_Vector2(p) * cell_dims
+            cell := maze_cell_ptr(m, p)
+            if cell.open {
                 if cell == player_cell {
-                    rl.DrawRectangleV(p, cell_dims, rl.BLUE)
+                    rl.DrawRectangleV(pos, cell_dims, rl.BLUE)
+                }
+                if cell.has_key {
+                    size :: 5
+                    k := pos + cell_dims/2 - size/2
+                    color := door_rl_color(cell.color)
+                    rl.DrawRectangleV(k, {size, size}, color)
                 }
                 continue
             }
-            rl.DrawRectangleV(p, cell_dims, rl.WHITE)
+            color := rl.BROWN
+            if cell.is_door {
+                color = door_rl_color(cell.color)
+            }
+            rl.DrawRectangleV(pos, cell_dims, color)
         }
     }
 
@@ -247,7 +471,10 @@ game_draw_2d :: proc(g: ^Game) {
 
     r := make_raycaster(g)
     for a in raycast_iter(&r) {
-        rl.DrawLineV(g.player, nearest_wall_point(&g.maze, g.player, a), rl.RED)
+        color := rl.RED
+        color.a = 10
+        p := nearest_wall_point(&g.maze, g.player, a)
+        rl.DrawLineV(g.player, p, color)
     }
 }
 
@@ -322,36 +549,44 @@ raycast_iter :: proc(r: ^Raycaster) -> (Vector2, int, bool) {
 }
 
 
+
 Maze :: struct {
-    cells: []Cell,
+    cells: [Maze_Cell_Array_Size]Cell,
     dims: [2]int,
     cell_dims: [2]int,
 }
 
-Cell :: enum {
-    Empty,
-    Wall,
+Maze_Width :: 100
+
+Min_Segment_Len :: 50
+//Min_Segment_Len :: 10
+Max_Segment_Len :: 100
+//Max_Segment_Len :: 20
+
+Maze_Cell_Array_Size :: Maze_Width * (Max_Segment_Len+1) * Segment_Count
+
+Cell :: bit_field u8 {
+    open:     bool | 1,
+    is_door:  bool | 1,
+    has_key:  bool | 1,
+    has_trap: bool | 1,
+    color: Door_Color | 2,
+    trap: Trap | 2,
 }
 
-maze_init :: proc(maze: ^Maze) {
-    x :: 20
-    y :: 20
-    maze.cells = make([]Cell, x * y)
-    maze.dims.x = x
-    maze.dims.y = y
-
-    maze.cell_dims = {50, 50}
+maze_cell_index :: proc(maze: ^Maze, p: [2]int) -> int {
+    return p.x + p.y * maze.dims.x
 }
 
-maze_cell_ptr :: proc(maze: ^Maze, x, y: int) -> ^Cell {
-    if x < 0 || x >= maze.dims.x do return nil
-    if y < 0 || y >= maze.dims.y do return nil
-    return &maze.cells[x + y * maze.dims.x]
+maze_cell_ptr :: proc(maze: ^Maze, p: [2]int) -> ^Cell {
+    if p.x < 0 || p.x >= maze.dims.x do return nil
+    if p.y < 0 || p.y >= maze.dims.y do return nil
+    return &maze.cells[maze_cell_index(maze, p)]
 }
 
-maze_cell :: proc(maze: ^Maze, x, y: int) -> Cell {
-    p := maze_cell_ptr(maze, x, y)
-    if p == nil do return .Empty
+maze_cell :: proc(maze: ^Maze, p: [2]int) -> Cell {
+    p := maze_cell_ptr(maze, p)
+    if p == nil do return {}
     return p^
 }
 
@@ -361,20 +596,22 @@ maze_cell_coords :: proc(maze: ^Maze, p: Vector2) -> [2]int {
 }
 
 maze_cell_pos_ptr :: proc(maze: ^Maze, p: Vector2) -> ^Cell {
-    cell := maze_cell_coords(maze, p)
-    return maze_cell_ptr(maze, int(cell.x), int(cell.y))
+    return maze_cell_ptr(maze, maze_cell_coords(maze, p))
 }
 
 maze_cell_pos :: proc(maze: ^Maze, p: Vector2) -> Cell {
     p := maze_cell_pos_ptr(maze, p)
-    if p == nil do return .Empty
+    if p == nil do return {}
     return p^
+}
+
+maze_cell_pos_index :: proc(maze: ^Maze, p: Vector2) -> int {
+    return maze_cell_index(maze, maze_cell_coords(maze, p))
 }
 
 nearest_wall_cell :: proc(maze: ^Maze, start: Vector2, dir: Vector2) -> [2]int {
     p := start
-    dp := f32(min(maze.cell_dims.x, maze.cell_dims.y)) / 2
-    for maze_cell_pos(maze, p) == .Empty {
+    for maze_cell_pos(maze, p).open {
         p += dir
     }
     return maze_cell_coords(maze, p)
@@ -399,4 +636,31 @@ nearest_wall_point :: proc(maze: ^Maze, start: Vector2, dir: Vector2) -> Vector2
     rc := rl.GetRayCollisionBox(ray, box)
 
     return rc.point.xy
+}
+
+
+
+draw_text :: proc(g: ^Game, titles: ..cstring) {
+    height :: 24
+    padding :: 5
+    total_height := len(titles) * height
+    total_height += (len(titles)-1) * padding
+
+    y := g.window_dims.y/2 - total_height/2
+
+    total_width := 0
+    for t in titles {
+        total_width = max(total_width, int(rl.MeasureText(t, height)))
+    }
+
+    x := g.window_dims.x/2 - total_width/2 
+
+    rl.DrawRectangle(i32(x), i32(y), i32(total_width), i32(total_height), rl.BROWN)
+
+    for t in titles {
+        width := int(rl.MeasureText(t, height))
+        x := g.window_dims.x/2 - width/2
+        rl.DrawText(t, i32(x), i32(y), height, rl.RAYWHITE)
+        y += height + padding
+    }
 }

@@ -3,6 +3,7 @@ package odin_7_day_jam
 
 import "core:math"
 import "core:math/linalg"
+import "core:math/rand"
 
 import rl "vendor:raylib"
 
@@ -18,3 +19,7 @@ sin :: proc(x: f32) -> f32 { return math.sin(math.to_radians(x)) }
 atan2 :: proc(y, x: f32) -> f32 { return math.to_degrees(math.atan2(y, x)) } 
 
 noz :: proc(v: Vector2) -> Vector2 { return linalg.normalize0(v) }
+
+rand_int_range :: proc(x, y: int) -> int {
+    return x + rand.int_max(y-x)
+}
