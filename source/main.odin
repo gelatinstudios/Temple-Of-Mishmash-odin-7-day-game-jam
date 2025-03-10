@@ -13,9 +13,10 @@ import rl "vendor:raylib"
 
 DEV :: true
 
+window_width  :: 640
+window_height :: 480
+
 main :: proc() {
-    window_width  :: 640
-    window_height :: 480
     rl.InitWindow(window_width, window_height, "THE TEMPLE OF MISHMASH")
 
     @static game: Game
@@ -25,6 +26,7 @@ main :: proc() {
     //rl.SetTargetFPS(60)
     for !rl.WindowShouldClose() {
         free_all(context.temp_allocator)
+        g.raycast_results_set = false
         game_update(g)
 
         rl.BeginDrawing()
@@ -47,6 +49,12 @@ load_texture :: proc($path: string) -> rl.Texture {
 
 Game :: struct {
     canon_path_indices: sa.Small_Array(Maze_Cell_Array_Size, int),
+    raycast_results_set: bool,
+    cells_in_view: [window_width]sa.Small_Array(Maze_Cell_Array_Size, [2]int),
+    wall_points: sa.Small_Array(window_width, Vector2),
+    wall_depths: sa.Small_Array(window_width, f32),
+    wall_cell_indices: sa.Small_Array(window_width, int),
+
     maze: Maze,
 
     state: Game_State,
@@ -66,6 +74,7 @@ Game :: struct {
     player_cell_index: int, // index
 
     wall_texture: rl.Texture,
+
 
     // dev draw 2d
     draw_2d: bool,
@@ -283,7 +292,7 @@ game_update_playing :: proc(g: ^Game) {
         moving = true
         g.player = new_pos
     } else if next_cell.is_door && next_cell.color in g.player_keys {
-        if next_cell.color == .White { // Reached White Door
+        if next_cell.color == .White {
             switch g.level {
                 case .Normal:
                     game_reset(g)
@@ -347,19 +356,16 @@ game_update_playing :: proc(g: ^Game) {
             ignore[index] = {}
         }
 
-        r := make_raycaster(g)
-        for a in raycast_iter(&r) {
-            p := g.player
-            for maze_cell_pos(m, p).open {
-                p += a
-                cell := maze_cell_coords(m, p)
-                ignore[maze_cell_index(m, cell)] = {}
+        cells_in_view, _, _, _ := get_raycast_results(g)
+        for &col in cells_in_view {
+            for c in sa.slice(&col) {
+                index := maze_cell_index(m, c)
+                ignore[index] = {}
             }
-            cell := maze_cell_coords(m, p)
-            ignore[maze_cell_index(m, cell)] = {}
         }
 
         player_cell := maze_cell_coords(m, g.player)
+
         for dy in -1..=1 {
             for dx in -1..=1 {
                 p := player_cell + {dx, dy}
@@ -469,22 +475,26 @@ game_draw_2d :: proc(g: ^Game) {
     player_size :: 5
     rl.DrawRectangleV(g.player - player_size/2, {player_size, player_size}, rl.GREEN)
 
-    r := make_raycaster(g)
-    for a in raycast_iter(&r) {
+    _, wall_points, _, _ := get_raycast_results(g)
+    for p in wall_points {
         color := rl.RED
         color.a = 10
-        p := nearest_wall_point(&g.maze, g.player, a)
         rl.DrawLineV(g.player, p, color)
     }
 }
 
 game_draw_raycast :: proc(g: ^Game) {
-    r := make_raycaster(g)
+    rl.DrawRectangle(0,              0, 
+                     window_width,   window_height/2, 
+                     rl.LIGHTGRAY)
+    rl.DrawRectangle(0,            window_height/2, 
+                     window_width, window_height/2, 
+                     rl.GRAY)
 
-    for norm, col in raycast_iter(&r) {
-        p := nearest_wall_point(&g.maze, g.player, norm)
+    m := &g.maze
+    cells_in_view, _, wall_depths, wall_cell_indices := get_raycast_results(g)
 
-        dist := linalg.distance(p, g.player)
+    for dist, col in wall_depths {
         depth := clamp(g.camera_plane / dist, 0, 1)
 
         half_screen_height := i32(g.window_dims.y/2)
@@ -493,60 +503,127 @@ game_draw_raycast :: proc(g: ^Game) {
         y0 := half_screen_height - dy
         y1 := half_screen_height + dy
 
-        rl.DrawLine(x, y0, x, y1, rl.WHITE)
-
-        source := rl.Rectangle {
-            x = f32(x + y0),
-            y = f32(y0),
-            width = f32(100 + x/2),
-            height = f32(y1-y0),
+        cell := m.cells[wall_cell_indices[col]]
+        color := rl.BROWN
+        if cell.is_door {
+            color = door_rl_color(cell.color)
         }
 
-        dest := rl.Rectangle {
-            x = f32(x),
-            y = f32(y0),
-            width = 1,
-            height = f32(y1-y0),
-        }
+        rl.DrawLine(x, y0, x, y1, color)
 
-//        rl.DrawTexturePro(g.wall_texture, source, dest, {}, 0, rl.WHITE)
+        for c in sa.slice(&cells_in_view[col]) {
+            // TODO: fix key rendering
+            cell := maze_cell(m, c)
+            if cell.has_key {
+                height :: 10
+                rl.DrawLine(x, half_screen_height - height/2,
+                            x, half_screen_height + height/2,
+                            door_rl_color(cell.color))
+            }
+        }
     }
 }
 
-
-
-Raycaster :: struct {
-    g: ^Game,
-    camera_plane_extent: Vector2,
-    col: int,
-}
-
-make_raycaster :: proc(g: ^Game) -> Raycaster {
-    camera_plane_dir := Vector2 {-g.player_dir.y, g.player_dir.x}
-    camera_plane_extent := camera_plane_dir
-    camera_plane_extent *= tan(g.fov / 2) * g.camera_plane
-
-    r: Raycaster
-    r.g = g
-    r.camera_plane_extent = camera_plane_extent
-    r.col = 0
-    return r
-}
-
-raycast_iter :: proc(r: ^Raycaster) -> (Vector2, int, bool) {
-    g := r.g
-    if r.col >= g.window_dims.x {
-        return {}, r.col, false
+get_raycast_results :: proc(g: ^Game) -> 
+    (cells_in_view: []sa.Small_Array(Maze_Cell_Array_Size, [2]int),
+     wall_points: []Vector2,
+     wall_depths: []f32,
+     wall_cell_indices: []int) 
+{
+    Raycaster :: struct {
+        g: ^Game,
+        camera_plane_extent: Vector2,
+        col: int,
     }
-    defer r.col += 1
-    d := f32(r.col) / f32(g.window_dims.x)
-    d = d * 2 - 1
-    p := g.player
-    p += g.player_dir * g.camera_plane
-    p += r.camera_plane_extent * d
-    dir := noz(p - g.player)
-    return dir, r.col, true
+
+    make_raycaster :: proc(g: ^Game) -> Raycaster {
+        camera_plane_dir := Vector2 {-g.player_dir.y, g.player_dir.x}
+        camera_plane_extent := camera_plane_dir
+        camera_plane_extent *= tan(g.fov / 2) * g.camera_plane
+
+        r: Raycaster
+        r.g = g
+        r.camera_plane_extent = camera_plane_extent
+        r.col = 0
+        return r
+    }
+
+    raycast_iter :: proc(r: ^Raycaster) -> (Vector2, int, bool) {
+        g := r.g
+        if r.col >= g.window_dims.x {
+            return {}, r.col, false
+        }
+        defer r.col += 1
+        d := f32(r.col) / f32(g.window_dims.x)
+        d = d * 2 - 1
+        p := g.player
+        p += g.player_dir * g.camera_plane
+        p += r.camera_plane_extent * d
+        dir := noz(p - g.player)
+        return dir, r.col, true
+    }
+
+    if g.raycast_results_set {
+        return g.cells_in_view[:], 
+               sa.slice(&g.wall_points), 
+               sa.slice(&g.wall_depths),
+               sa.slice(&g.wall_cell_indices)
+    }
+
+    m := &g.maze
+
+    for &c in g.cells_in_view {
+        sa.clear(&c)
+    }
+    sa.clear(&g.wall_points)
+    sa.clear(&g.wall_depths)
+    sa.clear(&g.wall_cell_indices)
+    cells_in_view_set := make(map[[2]int]struct{}, context.temp_allocator)
+
+    r := make_raycaster(g)
+    for dir, i in raycast_iter(&r) {
+        cells_in_view_set = {}
+
+        p := g.player
+        for maze_cell_pos(m, p).open {
+            p += dir
+            cell := maze_cell_coords(m, p)
+            cells_in_view_set[cell] = {}
+        }
+        cell := maze_cell_coords(m, p)
+        cell_min := to_Vector2(cell * m.cell_dims)
+        cell_max := cell_min + to_Vector2(m.cell_dims)
+
+        box := rl.BoundingBox {
+            min = {cell_min.x, cell_min.y, 0},
+            max = {cell_max.x, cell_max.y, 0},
+        }
+
+        ray := rl.Ray {
+            position = {g.player.x, g.player.y, 0},
+            direction = {dir.x, dir.y, 0},
+        }
+
+        rc := rl.GetRayCollisionBox(ray, box)
+
+        sa.append(&g.wall_points, rc.point.xy)
+        sa.append(&g.wall_depths, rc.distance)
+        sa.append(&g.wall_cell_indices, maze_cell_pos_index(m, p))
+
+        for c in cells_in_view_set {
+            sa.append(&g.cells_in_view[i], c)
+        }
+    }
+
+    g.raycast_results_set = true
+
+    return g.cells_in_view[:], 
+           sa.slice(&g.wall_points), 
+           sa.slice(&g.wall_depths),
+           sa.slice(&g.wall_cell_indices)
+
 }
+
 
 
 
@@ -558,10 +635,10 @@ Maze :: struct {
 
 Maze_Width :: 100
 
-Min_Segment_Len :: 50
-//Min_Segment_Len :: 10
-Max_Segment_Len :: 100
-//Max_Segment_Len :: 20
+//Min_Segment_Len :: 50
+Min_Segment_Len :: 10
+//Max_Segment_Len :: 100
+Max_Segment_Len :: 20
 
 Maze_Cell_Array_Size :: Maze_Width * (Max_Segment_Len+1) * Segment_Count
 
@@ -607,35 +684,6 @@ maze_cell_pos :: proc(maze: ^Maze, p: Vector2) -> Cell {
 
 maze_cell_pos_index :: proc(maze: ^Maze, p: Vector2) -> int {
     return maze_cell_index(maze, maze_cell_coords(maze, p))
-}
-
-nearest_wall_cell :: proc(maze: ^Maze, start: Vector2, dir: Vector2) -> [2]int {
-    p := start
-    for maze_cell_pos(maze, p).open {
-        p += dir
-    }
-    return maze_cell_coords(maze, p)
-}
-
-nearest_wall_point :: proc(maze: ^Maze, start: Vector2, dir: Vector2) -> Vector2 {
-    cell := nearest_wall_cell(maze, start, dir)
-
-    cell_min := to_Vector2(cell * maze.cell_dims)
-    cell_max := cell_min + to_Vector2(maze.cell_dims)
-
-    box := rl.BoundingBox {
-        min = {cell_min.x, cell_min.y, 0},
-        max = {cell_max.x, cell_max.y, 0},
-    }
-
-    ray := rl.Ray {
-        position = {start.x, start.y, 0},
-        direction = {dir.x, dir.y, 0},
-    }
-
-    rc := rl.GetRayCollisionBox(ray, box)
-
-    return rc.point.xy
 }
 
 
