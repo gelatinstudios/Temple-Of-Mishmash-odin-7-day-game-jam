@@ -74,7 +74,7 @@ Game :: struct {
     player_cell_index: int, // index
 
     wall_texture: rl.Texture,
-
+    key_texture: rl.Texture,
 
     // dev draw 2d
     draw_2d: bool,
@@ -114,6 +114,7 @@ game_init :: proc(g: ^Game, window_width, window_height: int) {
     game_reset(g)
 
     g.wall_texture = load_texture("../assets/circuit.png")
+    g.key_texture = load_texture("../assets/key.png")
 
     g.window_dims = {window_width, window_height}
     g.camera_plane = 25
@@ -220,6 +221,8 @@ game_reset :: proc(g: ^Game) {
     g.player_dir = {0, 1}
 
     g.player_cell_index = maze_cell_index(m, Player_Spawn)
+
+    g.player_keys = {}
 }
 
 game_reset_idol :: proc(g: ^Game) {
@@ -235,6 +238,8 @@ game_reset_idol :: proc(g: ^Game) {
     g.player_dir = {0, 1}
 
     g.player_cell_index = maze_cell_index(m, Player_Spawn)
+
+    g.player_keys = {}
 
     for y in 1 ..< m.dims.y-2 {
         for x in 1 ..< m.dims.x-2 {
@@ -405,6 +410,8 @@ game_draw :: proc(g: ^Game) {
         game_draw_raycast(g)
     }
 
+    game_draw_ui(g)
+
     if g.state == .Intro {
         draw_text(g, "Welcome to THE TEMPLE OF MISHMASH", 
                      "Use Arrow Keys To Move",
@@ -484,6 +491,7 @@ game_draw_2d :: proc(g: ^Game) {
 }
 
 game_draw_raycast :: proc(g: ^Game) {
+    rl.ClearBackground(rl.PINK)
     rl.DrawRectangle(0,              0, 
                      window_width,   window_height/2, 
                      rl.LIGHTGRAY)
@@ -492,12 +500,26 @@ game_draw_raycast :: proc(g: ^Game) {
                      rl.GRAY)
 
     m := &g.maze
-    cells_in_view, _, wall_depths, wall_cell_indices := get_raycast_results(g)
+
+    cell_dims := to_Vector2(m.cell_dims)
+
+    cells_in_view, wall_points, wall_depths, wall_cell_indices := get_raycast_results(g)
+
+    keys_drawn: bit_set[Door_Color]
+    Key_Draw_Info :: struct {
+        pos: Vector2,
+        scale: f32,
+        color: rl.Color,
+    }
+    keys: sa.Small_Array(window_width, Key_Draw_Info)
+
+    camera_plane_dir := Vector2 {-g.player_dir.y, g.player_dir.x}
+    half_screen_height := i32(g.window_dims.y/2)
+    half_screen_width  := f32(g.window_dims.x)*.5
 
     for dist, col in wall_depths {
         depth := clamp(g.camera_plane / dist, 0, 1)
 
-        half_screen_height := i32(g.window_dims.y/2)
         x := i32(col)
         dy := i32(depth * f32(g.window_dims.y/2))
         y0 := half_screen_height - dy
@@ -512,15 +534,44 @@ game_draw_raycast :: proc(g: ^Game) {
         rl.DrawLine(x, y0, x, y1, color)
 
         for c in sa.slice(&cells_in_view[col]) {
-            // TODO: fix key rendering
             cell := maze_cell(m, c)
-            if cell.has_key {
-                height :: 10
-                rl.DrawLine(x, half_screen_height - height/2,
-                            x, half_screen_height + height/2,
-                            door_rl_color(cell.color))
+            // TODO: make sure cells are sorted by z in raycaster?
+            if cell.has_key && cell.color not_in keys_drawn {
+                keys_drawn += {cell.color}
+
+                k := to_Vector2(c) * cell_dims + cell_dims/2
+                dist := linalg.distance(g.player, k)
+
+                sa.append(&keys, Key_Draw_Info {
+                    pos = k,
+                    scale = clamp(10 * g.camera_plane / dist, 0, 10),
+                    color = door_rl_color(cell.color)
+                })
             }
         }
+
+        {
+            camera: rl.Camera
+            camera.position = {g.player.x, g.player.y, 0}
+            camera.target = camera.position + {g.player_dir.x, g.player_dir.y, 0}
+            camera.up = {0, 0, -1}
+            camera.fovy = 45
+            camera.projection = .PERSPECTIVE
+            for k in sa.slice(&keys) {
+                s := rl.GetWorldToScreen({k.pos.x, k.pos.y, 0}, camera)
+                rl.DrawTextureEx(g.key_texture, s, 0, k.scale, k.color)
+            }
+        }
+    }
+}
+
+game_draw_ui :: proc(g: ^Game) {
+    padding :: 5
+    x: i32 = padding
+    y: i32 = window_height - padding - g.key_texture.height
+    for k in g.player_keys {
+        rl.DrawTexture(g.key_texture, x, y, door_rl_color(k))
+        x += g.key_texture.width + padding
     }
 }
 
@@ -590,24 +641,11 @@ get_raycast_results :: proc(g: ^Game) ->
             cell := maze_cell_coords(m, p)
             cells_in_view_set[cell] = {}
         }
-        cell := maze_cell_coords(m, p)
-        cell_min := to_Vector2(cell * m.cell_dims)
-        cell_max := cell_min + to_Vector2(m.cell_dims)
 
-        box := rl.BoundingBox {
-            min = {cell_min.x, cell_min.y, 0},
-            max = {cell_max.x, cell_max.y, 0},
-        }
+        point, dist := ray_cell_collision(m, g.player, dir, maze_cell_coords(m, p))
 
-        ray := rl.Ray {
-            position = {g.player.x, g.player.y, 0},
-            direction = {dir.x, dir.y, 0},
-        }
-
-        rc := rl.GetRayCollisionBox(ray, box)
-
-        sa.append(&g.wall_points, rc.point.xy)
-        sa.append(&g.wall_depths, rc.distance)
+        sa.append(&g.wall_points, point)
+        sa.append(&g.wall_depths, dist)
         sa.append(&g.wall_cell_indices, maze_cell_pos_index(m, p))
 
         for c in cells_in_view_set {
@@ -621,7 +659,48 @@ get_raycast_results :: proc(g: ^Game) ->
            sa.slice(&g.wall_points), 
            sa.slice(&g.wall_depths),
            sa.slice(&g.wall_cell_indices)
+}
 
+ray_cell_collision :: proc(m: ^Maze, ray_start, dir: Vector2, cell: [2]int) -> 
+                          (point: Vector2, dist: f32)
+{
+    cell_min := to_Vector2(cell * m.cell_dims)
+    cell_max := cell_min + to_Vector2(m.cell_dims)
+
+    box := rl.BoundingBox {
+        min = {cell_min.x, cell_min.y, 0},
+        max = {cell_max.x, cell_max.y, 0},
+    }
+
+    ray := rl.Ray {
+        position = {ray_start.x, ray_start.y, 0},
+        direction = {dir.x, dir.y, 0},
+    }
+
+    rc := rl.GetRayCollisionBox(ray, box)
+
+    return rc.point.xy, rc.distance
+}
+
+key_size :: proc(m: ^Maze) -> int {
+    return m.cell_dims.x / 2
+}
+
+ray_key_collision :: proc(m: ^Maze, ray_start, dir: Vector2, cell: [2]int) -> 
+                         (point: Vector2, dist: f32)
+{
+    ray := rl.Ray {
+        position = {ray_start.x, ray_start.y, 0},
+        direction = {dir.x, dir.y, 0},
+    }
+
+    p: [3]f32
+    p.x = f32(cell.x) * f32(m.cell_dims.x) + f32(m.cell_dims.x)*.5
+    p.y = f32(cell.y) * f32(m.cell_dims.y) + f32(m.cell_dims.y)*.5
+
+    rc := rl.GetRayCollisionSphere(ray, p, f32(key_size(m)))
+
+    return rc.point.xy, rc.distance
 }
 
 
