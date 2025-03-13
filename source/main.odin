@@ -19,6 +19,24 @@ screen_height :: 480
 screen_dims  :: [2]int {screen_width, screen_height}
 screen_dimsf :: Vector2 {screen_width, screen_height}
 
+// VISUALS:
+// TODO: give keys outline
+// TODO: Intro and outro words make look better (font and stuff)
+// TODO: Intro cutscene of logo?
+
+// GAME DESIGN:
+// TODO: keys spawn in extra paths
+// TODO: for Randomized, save ALL paths and rearrange any extra paths you aren't in
+// TODO: some kind of difficulty progression throughout?
+
+// AUDIO:
+// TODO: music
+// TODO: sound effects:
+//         - footsteps
+//         - key pickup
+//         - doors
+//         - idol pickup
+
 main :: proc() {
     rl.InitWindow(0, 0, "THE TEMPLE OF MISHMASH")
 
@@ -65,6 +83,12 @@ main :: proc() {
     }
 }
 
+load_image :: proc($path: string) -> rl.Image {
+    png_data :: #load(path)
+    im := rl.LoadImageFromMemory(".png", raw_data(png_data), i32(len(png_data)))
+    return im
+}
+
 load_texture :: proc($path: string) -> rl.Texture {
     png_data :: #load(path)
     im := rl.LoadImageFromMemory(".png", raw_data(png_data), i32(len(png_data)))
@@ -76,8 +100,7 @@ load_texture :: proc($path: string) -> rl.Texture {
 }
 
 Game :: struct {
-
-    canon_path_indices: []int,
+    canon_path_indices: sa.Small_Array(Maze_Cell_Array_Size, int),
     raycast_results: Maybe(Raycast_Results),
 
     maze: Maze,
@@ -113,14 +136,12 @@ Game_State :: enum {
 
 Win_Door_Color :: Door_Color.Yellow
 
-Trap :: enum u8 { } // TODO
-
 Door_Color :: enum u8 { Red, Yellow, Black, White }
 door_rl_color :: proc(d: Door_Color) -> rl.Color {
     switch d {
         case .Red: return rl.RED
-        case .Yellow: return rl.YELLOW
-        case .Black: return rl.BLACK
+        case .Yellow: return rl.PURPLE + {40, 40, 40, 0}
+        case .Black: return {109, 0, 183, 255}
         case .White: return rl.WHITE
     }
     return rl.PINK
@@ -171,14 +192,16 @@ game_reset :: proc(g: ^Game) {
 
     // choose y positions for keys
     key_y_positions: [Segment_Count]int
+    key_range_start := 1
     for &y, i in key_y_positions {
         for {
             seg_wall := g.segment_walls[i]
-            n := rand_int_range(1, seg_wall-1)
+            n := rand_int_range(key_range_start, seg_wall-1)
             if !slice.contains(g.segment_walls[:], n) && 
                !slice.contains(key_y_positions[:], n)
             {
                 y = n
+                key_range_start = n + 5
                 break
             }
         }
@@ -206,18 +229,18 @@ game_reset :: proc(g: ^Game) {
 
     door_keys: [Segment_Count]int
     
-    canon_path_indices := make([dynamic]int, context.temp_allocator)
+    sa.clear(&g.canon_path_indices)
 
     p := Player_Spawn
     for seg_wall, i in g.segment_walls {
         start_of_path := true
         for p.y < seg_wall {
             // extra paths
-            if p.x < m.dims.x-3 && rand.float64() < 0.01 {
+            if p.x < m.dims.x-3 && rand.float64() < 0.05 {
                 maze_cell_ptr(m, p + {1, 0}).open = true
                 rand_path(m, p + {2, 0}, seg_wall-1)
             }
-            if p.x > 3          && rand.float64() < 0.01 {
+            if p.x > 3          && rand.float64() < 0.05 {
                 maze_cell_ptr(m, p - {1, 0}).open = true
                 rand_path(m, p - {2, 0}, seg_wall-1)
             }
@@ -226,7 +249,7 @@ game_reset :: proc(g: ^Game) {
 
             // canon path
             maze_cell_ptr(m, p).open = true
-            append(&canon_path_indices, index)
+            sa.append(&g.canon_path_indices, index)
 
             p += start_of_path ? {0, 1} : rand_step(m, p)
             for k, i in key_y_positions {
@@ -241,8 +264,6 @@ game_reset :: proc(g: ^Game) {
         cell.color   = Door_Color(i)
         p.y += 1
     }
-
-    g.canon_path_indices = canon_path_indices[:]
 
     // set door key cells
     for index, color_index in door_keys {
@@ -404,7 +425,7 @@ game_update_playing :: proc(g: ^Game) {
     if moving && g.level == .Randomize {
         ignore := make(map[int]struct{}, context.temp_allocator)
 
-        for index in g.canon_path_indices {
+        for index in sa.slice(&g.canon_path_indices) {
             ignore[index] = {}
         }
 
@@ -442,7 +463,7 @@ game_update_playing :: proc(g: ^Game) {
             for x in start_x..=end_x {
                 index := maze_cell_index(m, {x, y})
                 if index not_in ignore {
-                    m.cells[index].open = rand.float64() < .3
+                    m.cells[index].open = rand.float64() < .4
                 }
             }
         }
@@ -489,8 +510,8 @@ game_draw_2d :: proc(g: ^Game) {
 
     player_cell := maze_cell_pos_ptr(m, g.player)
 
-    start := g.player - (screen_dimsf + cell_dims)
-    end   := g.player + (screen_dimsf + cell_dims)
+    start := g.player - (screen_dimsf + cell_dims) / g.zoom_2d
+    end   := g.player + (screen_dimsf + cell_dims) / g.zoom_2d
 
     start_cell := maze_cell_coords(m, start)
     end_cell   := maze_cell_coords(m, end)
@@ -539,10 +560,10 @@ game_draw_raycast :: proc(g: ^Game) {
     rl.ClearBackground(rl.PINK)
     rl.DrawRectangle(0,              0, 
                      screen_width,   screen_height/2, 
-                     rl.LIGHTGRAY)
+                     rl.BROWN + {40, 40, 40, 0})
     rl.DrawRectangle(0,            screen_height/2, 
                      screen_width, screen_height/2, 
-                     rl.GRAY)
+                     rl.BROWN + {50, 50, 50, 0})
 
     m := &g.maze
 
@@ -682,13 +703,21 @@ game_draw_raycast :: proc(g: ^Game) {
 }
 
 game_draw_ui :: proc(g: ^Game) {
-    padding :: 5
-    x: i32 = padding
-    y: i32 = screen_height - padding - g.key_texture.height
+    border :: 5
+    padding :: -5
+    x: i32 = border
+    y: i32 = screen_height - border - g.key_texture.height
     for k in g.player_keys {
         rl.DrawTexture(g.key_texture, x, y, door_rl_color(k))
         x += g.key_texture.width + padding
     }
+}
+
+get_camera_plane_extent :: proc(g: ^Game) -> Vector2 {
+    camera_plane_dir := Vector2 {-g.player_dir.y, g.player_dir.x}
+    camera_plane_extent := camera_plane_dir
+    camera_plane_extent *= tan(g.fov / 2) * g.camera_plane
+    return camera_plane_extent   
 }
 
 get_raycast_results :: proc(g: ^Game) -> Raycast_Results {
@@ -699,13 +728,9 @@ get_raycast_results :: proc(g: ^Game) -> Raycast_Results {
     }
 
     make_raycaster :: proc(g: ^Game) -> Raycaster {
-        camera_plane_dir := Vector2 {-g.player_dir.y, g.player_dir.x}
-        camera_plane_extent := camera_plane_dir
-        camera_plane_extent *= tan(g.fov / 2) * g.camera_plane
-
         r: Raycaster
         r.g = g
-        r.camera_plane_extent = camera_plane_extent
+        r.camera_plane_extent = get_camera_plane_extent(g)
         r.col = 0
         return r
     }
