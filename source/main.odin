@@ -131,7 +131,8 @@ Raycast_Result_Column :: struct {
     point: Vector2,
     dist: f32,
     hit_cell: Cell,
-    cells_in_view: [][2]int, // indices
+    tex_u_coord: f32,
+    cells_in_view: [][2]int,
 }
 
 Segment_Count :: 4
@@ -571,6 +572,7 @@ game_draw_raycast :: proc(g: ^Game) {
     Wall_Column :: struct {
         z: f32,
         x, y0, y1: i32,
+        source, dest: rl.Rectangle,
         color: rl.Color,
     }
 
@@ -578,7 +580,7 @@ game_draw_raycast :: proc(g: ^Game) {
 
     // draw walls
     for col, col_index in get_raycast_results(g) {
-        depth := clamp(g.camera_plane / col.dist, 0, 1)
+        depth := g.camera_plane / col.dist
 
         x := i32(col_index)
         dy := i32(depth * half_screen_height)
@@ -591,13 +593,27 @@ game_draw_raycast :: proc(g: ^Game) {
             color = door_rl_color(cell.color)
         }
 
-        for y in y0..<y1 {
+        for y in max(y0, 0)..<min(y1, screen_height-1) {
             z_buffer[x][y] = col.dist
         }
 
-        rl.DrawLine(x, y0, x, y1, color)
+        source := rl.Rectangle {
+            x = col.tex_u_coord * f32(g.wall_texture.width),
+            y = 0,
+            width = 1,
+            height = f32(g.wall_texture.height),
+        }
 
-        wall_cols[col_index] = {col.dist, x, y0, y1, color}
+        dest := rl.Rectangle {
+            x = f32(x),
+            y = f32(y0),
+            width = 1,
+            height = f32(y1-y0),
+        }
+
+        rl.DrawTexturePro(g.wall_texture, source, dest, {}, 0, color)
+
+        wall_cols[col_index] = {col.dist, x, y0, y1, source, dest, color}
     }
 
     { // draw keys
@@ -610,7 +626,7 @@ game_draw_raycast :: proc(g: ^Game) {
                     k := to_Vector2(coord) * cell_dims + cell_dims/2
                     dist := linalg.distance(g.player, k)
 
-                    N :: 15
+                    N :: 7
                     sa.append(&keys, Key_Draw_Info {
                         pos = k,
                         scale = clamp(N * g.camera_plane / dist, 0, N),
@@ -653,14 +669,14 @@ game_draw_raycast :: proc(g: ^Game) {
     // we draw the walls twice because of z buffering stupidity
     for c in wall_cols {
         draw := true
-        for y in c.y0..<c.y1 {
+        for y in max(c.y0, 0)..<min(c.y1, screen_height-1) {
             if z_buffer[c.x][y] < c.z {
                 draw = false
                 break
             }
         }
         if draw {
-           rl.DrawLine(c.x, c.y0, c.x, c.y1, c.color)
+            rl.DrawTexturePro(g.wall_texture, c.source, c.dest, {}, 0, c.color)
         }
     }
 }
@@ -733,6 +749,7 @@ get_raycast_results :: proc(g: ^Game) -> Raycast_Results {
         ray_len: Vector2
         step: [2]int
         dist: f32
+        x_side: bool
         if dir.x < 0 {
             step.x = -1
             ray_len.x = (p.x - f32(coord.x)) * ray_unit.x
@@ -752,10 +769,12 @@ get_raycast_results :: proc(g: ^Game) -> Raycast_Results {
                 coord.x += step.x
                 dist = ray_len.x
                 ray_len.x += ray_unit.x
+                x_side = true
             } else {
                 coord.y += step.y
                 dist = ray_len.y
                 ray_len.y += ray_unit.y
+                x_side = false
             }
             append(&cells_in_view, coord)
         }
@@ -763,10 +782,19 @@ get_raycast_results :: proc(g: ^Game) -> Raycast_Results {
         dist *= cell_dims.x
         point := g.player + dist * dir
 
+        // https://lodev.org/cgtutor/raycasting.html
+        tex_u_coord: f32
+        if x_side do tex_u_coord = p.y + (ray_len.x - ray_unit.x) * dir.y
+        else      do tex_u_coord = p.x + (ray_len.y - ray_unit.y) * dir.x
+        tex_u_coord -= math.floor(tex_u_coord)
+        if  x_side && dir.x > 0 do tex_u_coord = 1 - tex_u_coord
+        if !x_side && dir.y < 0 do tex_u_coord = 1 - tex_u_coord
+
         results[i] = Raycast_Result_Column {
             point = point,
             dist = dist,
             hit_cell = maze_cell(m, coord),
+            tex_u_coord = tex_u_coord,
             cells_in_view = cells_in_view[:]
         }
     }
@@ -817,7 +845,6 @@ maze_cell :: proc(maze: ^Maze, p: [2]int) -> Cell {
     if p == nil do return {}
     return p^
 }
-
 maze_cell_coords :: proc(maze: ^Maze, p: Vector2) -> [2]int {
     c := p / to_Vector2(maze.cell_dims)
     return {int(c.x), int(c.y)}
