@@ -12,5 +12,5 @@ when RUN != 0 {
 }
 
 main :: proc() {
-    libc.system("odin "+cmd+" source -debug -out:game.exe")
+    libc.system("odin "+cmd+" source -o:speed -out:game.exe")
 }

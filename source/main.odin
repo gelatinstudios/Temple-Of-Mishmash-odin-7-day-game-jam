@@ -11,7 +11,8 @@ import ba "core:container/bit_array"
 
 import rl "vendor:raylib"
 
-DEV :: true
+DEVN :: 0
+DEV :: DEVN != 0
 
 screen_width  :: 640
 screen_height :: 480
@@ -20,25 +21,22 @@ screen_dims  :: [2]int {screen_width, screen_height}
 screen_dimsf :: Vector2 {screen_width, screen_height}
 
 // VISUALS:
-// TODO: give keys outline
+// TODO: door sprite
 // TODO: Intro and outro words make look better (font and stuff)
-// TODO: Intro cutscene of logo?
 
 // GAME DESIGN:
 // TODO: keys spawn in extra paths
 // TODO: for Randomized, save ALL paths and rearrange any extra paths you aren't in
 // TODO: some kind of difficulty progression throughout?
 
-// AUDIO:
-// TODO: music
-// TODO: sound effects:
-//         - footsteps
-//         - key pickup
-//         - doors
-//         - idol pickup
+// STRETCH:
+// TODO: controller support 
+// TODO: Intro cutscene of logo?
 
 main :: proc() {
     rl.InitWindow(0, 0, "THE TEMPLE OF MISHMASH")
+
+    rl.InitAudioDevice()
 
     mon := rl.GetCurrentMonitor()
     w, h: i32 = screen_width, screen_height
@@ -52,7 +50,7 @@ main :: proc() {
     rl.SetWindowPosition(rl.GetMonitorWidth (mon)/2 - w/2,
                          rl.GetMonitorHeight(mon)/2 - h/2)
 
-    rl.DisableCursor()
+    //rl.DisableCursor()
 
     rend_tex := rl.LoadRenderTexture(screen_width, screen_height)
     rl.SetTextureFilter(rend_tex.texture, .POINT)
@@ -61,6 +59,7 @@ main :: proc() {
     g := &game
     game_init(g, screen_width, screen_height)
 
+    rl.SetTargetFPS(rl.GetMonitorRefreshRate(mon))
     for !rl.WindowShouldClose() {
         free_all(context.temp_allocator)
         g.raycast_results = {}
@@ -70,7 +69,8 @@ main :: proc() {
         rl.BeginTextureMode(rend_tex)
         rl.ClearBackground(rl.BLACK)
         game_draw(g)
-        rl.DrawFPS(5, 5)
+
+
         rl.EndTextureMode()
 
         rl.DrawTexturePro(texture =  rend_tex.texture, 
@@ -79,6 +79,11 @@ main :: proc() {
                           origin = {}, 
                           rotation = 0, 
                           tint = rl.WHITE)
+
+        when DEV {
+            rl.DrawFPS(5, 5)
+        }
+
         rl.EndDrawing()
     }
 }
@@ -97,6 +102,17 @@ load_texture :: proc($path: string) -> rl.Texture {
     rl.SetTextureFilter(tex, .POINT)
     rl.SetTextureWrap(tex, .MIRROR_REPEAT)
     return tex
+}
+
+load_music :: proc($path: string) -> rl.Music {
+    mp3_data :: #load(path)
+    return rl.LoadMusicStreamFromMemory(".mp3", raw_data(mp3_data), i32(len(mp3_data)))
+}
+
+load_sound :: proc($path: string) -> rl.Sound {
+    mp3_data :: #load(path)
+    wave := rl.LoadWaveFromMemory(".mp3", raw_data(mp3_data), i32(len(mp3_data)))
+    return rl.LoadSoundFromWave(wave)
 }
 
 Game :: struct {
@@ -122,6 +138,13 @@ Game :: struct {
 
     wall_texture: rl.Texture,
     key_texture: rl.Texture,
+    idol_texture: rl.Texture,
+
+    musics: [Level]rl.Music,
+
+    sfx_door, sfx_footstep, sfx_idol, sfx_key: rl.Sound,
+
+    footstep_timer: f32,
 
     // dev draw 2d
     draw_2d: bool,
@@ -169,6 +192,20 @@ game_init :: proc(g: ^Game, screen_width, screen_height: int) {
 
     g.wall_texture = load_texture("../assets/circuit.png")
     g.key_texture = load_texture("../assets/key.png")
+    g.idol_texture = load_texture("../assets/idol.png")
+
+    g.musics[.Normal] = load_music("../assets/music_1.mp3")
+    g.musics[.Randomize] = load_music("../assets/music_2.mp3")
+
+    g.sfx_door = load_sound("../assets/sfx_door.mp3")
+    g.sfx_footstep = load_sound("../assets/sfx_footstep.mp3")
+    g.sfx_idol = load_sound("../assets/sfx_idol.mp3")
+    g.sfx_key = load_sound("../assets/sfx_key.mp3")
+
+    rl.SetSoundVolume(g.sfx_footstep, 0.1)
+
+    rl.PlayMusicStream(g.musics[.Normal])
+    rl.PlayMusicStream(g.musics[.Randomize])
 
     g.camera_plane = 25
     g.fov = 55
@@ -298,8 +335,12 @@ game_reset_idol :: proc(g: ^Game) {
 
     g.player_keys = {}
 
-    for y in 1 ..< m.dims.y-2 {
-        for x in 1 ..< m.dims.x-2 {
+    width :: 5
+    start_x := m.dims.x/2 - width/2
+    end_x := m.dims.x/2 + width/2
+
+    for y in 1 ..< m.dims.y-1 {
+        for x in start_x ..= end_x {
             maze_cell_ptr(m, {x, y}).open = true
         }
     }
@@ -327,6 +368,9 @@ game_update_playing :: proc(g: ^Game) {
     m := &g.maze
 
     moving := false
+    stepping := false
+
+    rl.UpdateMusicStream(g.musics[g.level])
 
     a := to_angle(g.player_dir)
     da :: 100
@@ -347,33 +391,37 @@ game_update_playing :: proc(g: ^Game) {
     dp :: 75
     new_pos: Vector2
     if rl.IsKeyDown(.W) || rl.IsKeyDown(.UP) {
+        stepping = true
         new_pos = g.player + forward * dt * dp
     }
     if rl.IsKeyDown(.S) || rl.IsKeyDown(.DOWN) {
+        stepping = true
         new_pos = g.player - forward * dt * dp
     }
     if rl.IsKeyDown(.A) {
+        stepping = true
         new_pos = g.player + right * dt * dp
     } 
     if rl.IsKeyDown(.D)  {
+        stepping = true
         new_pos = g.player - right * dt * dp
     }
-
 
     next_cell := maze_cell_pos_ptr(m, new_pos)
     if next_cell.open {
         moving = true
         g.player = new_pos
     } else if next_cell.is_door && next_cell.color in g.player_keys {
+        rl.PlaySound(g.sfx_door)
+
         if next_cell.color == .White {
             switch g.level {
                 case .Normal:
-                    game_reset(g)
-                    g.level = .Randomize
+                    game_start_randomize(g)
                     return
                 case .Randomize:
-                    game_reset_idol(g)
-                    g.level = .Idol
+                    game_start_idol(g)
+                    return
                 case .Idol: unreachable()
             }
         } else if next_cell.color == Win_Door_Color && g.level == .Idol {
@@ -393,24 +441,19 @@ game_update_playing :: proc(g: ^Game) {
         }
     }
 
+    if stepping && new_pos == g.player {
+        g.footstep_timer -= dt
+        if g.footstep_timer < 0 {
+            g.footstep_timer = 0.3
+            rl.PlaySound(g.sfx_footstep)
+        }
+    }
+
     when DEV {
-        if rl.IsKeyPressed(.M) {
-            g.draw_2d = !g.draw_2d
-        }
-
-        if rl.IsKeyPressed(.L) {
-            game_reset(g)
-            g.level = .Randomize
-        }
-
-        if rl.IsKeyPressed(.I) {
-            game_reset_idol(g)
-            g.level = .Idol
-        }
-
-        if g.draw_2d {
-            g.zoom_2d += rl.GetMouseWheelMove() * 0.05
-        }
+        if rl.IsKeyPressed(.M) do g.draw_2d = !g.draw_2d
+        if rl.IsKeyPressed(.L) do game_start_randomize(g)
+        if rl.IsKeyPressed(.I) do game_start_idol(g)
+        if g.draw_2d do g.zoom_2d += rl.GetMouseWheelMove() * 0.05
     }
 
     g.player_cell_index = maze_cell_pos_index(m, g.player)
@@ -420,6 +463,12 @@ game_update_playing :: proc(g: ^Game) {
     if player_cell.has_key {
         player_cell.has_key = false
         g.player_keys += {player_cell.color}
+
+        if g.level == .Idol {
+            rl.PlaySound(g.sfx_idol)
+        } else {
+            rl.PlaySound(g.sfx_key)
+        }
     }
 
     if moving && g.level == .Randomize {
@@ -468,6 +517,17 @@ game_update_playing :: proc(g: ^Game) {
             }
         }
     }
+}
+
+game_start_randomize :: proc(g: ^Game) {
+    game_reset(g)
+    g.level = .Randomize
+    rl.SeekMusicStream(g.musics[.Randomize], rl.GetMusicTimePlayed(g.musics[.Normal]))
+}
+
+game_start_idol :: proc(g: ^Game) {
+    game_reset_idol(g)
+    g.level = .Idol
 }
 
 game_draw :: proc(g: ^Game) {
@@ -668,10 +728,15 @@ game_draw_raycast :: proc(g: ^Game) {
         camera.up = {0, 0, -1}
         camera.fovy = 40 // idfk where this number comes from it just feels best
         camera.projection = .PERSPECTIVE
+
+        texture, tex_scale := pickup_texture(g)
+
+
         for k in sa.slice(&keys) {
+            scale := k.scale * tex_scale
             s := rl.GetWorldToScreenEx({k.pos.x, k.pos.y, 0}, camera, screen_width, screen_height)
-            w := f32(g.key_texture.width)  * k.scale
-            h := f32(g.key_texture.height) * k.scale
+            w := f32(texture.width)  * scale
+            h := f32(texture.height) * scale
             s -= {w, h} * .5
             x_start := max(int(s.x), 0)
             y_start := max(int(s.y), 0)
@@ -682,7 +747,8 @@ game_draw_raycast :: proc(g: ^Game) {
                     z_buffer[x][y] = k.dist
                 }
             }
-            rl.DrawTextureEx(g.key_texture, s, 0, k.scale, k.color)
+
+            rl.DrawTextureEx(texture, s, 0, scale, k.color)
         }
     }
 
@@ -703,14 +769,22 @@ game_draw_raycast :: proc(g: ^Game) {
 }
 
 game_draw_ui :: proc(g: ^Game) {
+    texture, _ := pickup_texture(g)
     border :: 5
     padding :: -5
     x: i32 = border
-    y: i32 = screen_height - border - g.key_texture.height
+    y: i32 = screen_height - border - texture.height
     for k in g.player_keys {
-        rl.DrawTexture(g.key_texture, x, y, door_rl_color(k))
-        x += g.key_texture.width + padding
+        rl.DrawTexture(texture, x, y, door_rl_color(k))
+        x += texture.width + padding
     }
+}
+
+pickup_texture :: proc(g: ^Game) -> (rl.Texture, f32) {
+    if g.level == .Idol {
+        return g.idol_texture, .5
+    }
+    return g.key_texture, 1
 }
 
 get_camera_plane_extent :: proc(g: ^Game) -> Vector2 {
@@ -852,7 +926,6 @@ Cell :: bit_field u8 {
     has_key:  bool | 1,
     has_trap: bool | 1,
     color: Door_Color | 2,
-    trap: Trap | 2,
 }
 
 maze_cell_index :: proc(maze: ^Maze, p: [2]int) -> int {
