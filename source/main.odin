@@ -11,7 +11,7 @@ import ba "core:container/bit_array"
 
 import rl "vendor:raylib"
 
-DEVN :: 0
+DEVN :: 1
 DEV :: DEVN != 0
 
 screen_width  :: 640
@@ -19,15 +19,6 @@ screen_height :: 480
 
 screen_dims  :: [2]int {screen_width, screen_height}
 screen_dimsf :: Vector2 {screen_width, screen_height}
-
-// VISUALS:
-// TODO: door sprite
-// TODO: Intro and outro words make look better (font and stuff)
-
-// GAME DESIGN:
-// TODO: keys spawn in extra paths
-// TODO: for Randomized, save ALL paths and rearrange any extra paths you aren't in
-// TODO: some kind of difficulty progression throughout?
 
 // STRETCH:
 // TODO: controller support 
@@ -53,7 +44,6 @@ main :: proc() {
     //rl.DisableCursor()
 
     rend_tex := rl.LoadRenderTexture(screen_width, screen_height)
-    rl.SetTextureFilter(rend_tex.texture, .POINT)
 
     @static game: Game
     g := &game
@@ -100,7 +90,6 @@ load_texture :: proc($path: string) -> rl.Texture {
     defer rl.UnloadImage(im)
     tex := rl.LoadTextureFromImage(im)
     rl.SetTextureFilter(tex, .POINT)
-    rl.SetTextureWrap(tex, .MIRROR_REPEAT)
     return tex
 }
 
@@ -115,9 +104,19 @@ load_sound :: proc($path: string) -> rl.Sound {
     return rl.LoadSoundFromWave(wave)
 }
 
+Font_Size :: 12
+
+load_font :: proc($path: string) -> rl.Font {
+    ttf_data :: #load(path)
+    return rl.LoadFontFromMemory(".ttf", raw_data(ttf_data), i32(len(ttf_data)), 
+                                 Font_Size, nil, 100)
+}
+
 Game :: struct {
-    canon_path_indices: sa.Small_Array(Maze_Cell_Array_Size, int),
+    canon_path_indices: sa.Small_Array(1<<16, int),
     raycast_results: Maybe(Raycast_Results),
+
+    cells_visited_indices: map[int]struct{},
 
     maze: Maze,
 
@@ -125,26 +124,28 @@ Game :: struct {
 
     level: Level,
 
-    segment_walls: [Segment_Count]int,
-
     player: Vector2,
     player_dir: Vector2,
     camera_plane: f32,
     fov: f32, // in degrees
+
+    segment_walls: [Segment_Count]int,
 
     player_keys: bit_set[Door_Color],
 
     player_cell_index: int, // index
 
     wall_texture: rl.Texture,
+    door_texture: rl.Texture,
     key_texture: rl.Texture,
     idol_texture: rl.Texture,
 
     musics: [Level]rl.Music,
 
     sfx_door, sfx_footstep, sfx_idol, sfx_key: rl.Sound,
-
     footstep_timer: f32,
+
+    font: rl.Font,
 
     // dev draw 2d
     draw_2d: bool,
@@ -185,12 +186,15 @@ Level :: enum { Normal, Randomize, Idol }
 
 Player_Spawn :: [2]int {Maze_Width/2, 1}
 
+segment_lengths :: [Segment_Count]int {10, 15, 25, 35}
+
 game_init :: proc(g: ^Game, screen_width, screen_height: int) {
     m := &g.maze
 
     game_reset(g)
 
     g.wall_texture = load_texture("../assets/circuit.png")
+    g.door_texture = load_texture("../assets/door.png")
     g.key_texture = load_texture("../assets/key.png")
     g.idol_texture = load_texture("../assets/idol.png")
 
@@ -202,10 +206,12 @@ game_init :: proc(g: ^Game, screen_width, screen_height: int) {
     g.sfx_idol = load_sound("../assets/sfx_idol.mp3")
     g.sfx_key = load_sound("../assets/sfx_key.mp3")
 
-    rl.SetSoundVolume(g.sfx_footstep, 0.1)
+    rl.SetSoundVolume(g.sfx_footstep, 0.3)
 
     rl.PlayMusicStream(g.musics[.Normal])
     rl.PlayMusicStream(g.musics[.Randomize])
+
+    g.font = load_font("../assets/Ancient God.ttf")
 
     g.camera_plane = 25
     g.fov = 55
@@ -219,17 +225,17 @@ game_reset :: proc(g: ^Game) {
     m.cell_dims = {50, 50}
     cell_dims := to_Vector2(m.cell_dims)
     m.dims.x = Maze_Width
-    m.dims.y = 0
-    for &s in g.segment_walls {
-        n := rand_int_range(Min_Segment_Len, Max_Segment_Len)
+
+    m.dims.y = 1
+    for n, i in segment_lengths {
         m.dims.y += n
-        s = m.dims.y
+        g.segment_walls[i] = m.dims.y
     }
     m.dims.y += 1
 
     // choose y positions for keys
     key_y_positions: [Segment_Count]int
-    key_range_start := 1
+    key_range_start := 2
     for &y, i in key_y_positions {
         for {
             seg_wall := g.segment_walls[i]
@@ -245,7 +251,7 @@ game_reset :: proc(g: ^Game) {
     }
 
     // create path to each door
-    rand_step :: proc(m: ^Maze, p: [2]int) -> [2]int {
+    rand_step :: proc(m: ^Maze, p: [2]int, dir: int, chance: f64) -> [2]int {
         dp_choices: [][2]int
         if p.x == 1 {
             dp_choices = {{0, 1}, {1, 0}}
@@ -254,13 +260,25 @@ game_reset :: proc(g: ^Game) {
         } else {
             dp_choices = {{0, 1}, {-1, 0}, {1, 0}}
         }
+        for dp in dp_choices {
+            if dp.y == 0 && dp.x == dir && rand.float64() < chance {
+                return dp
+            }
+        }
         return rand.choice(dp_choices)
     }
-    rand_path :: proc(m: ^Maze, start: [2]int, stop_y: int) {
+    rand_path :: proc(m: ^Maze, start: [2]int, stop_y: int, dir: int, path_cap: int) {
+        n := 0
+        chance := .8
         e := start
         for e.y < stop_y {
             maze_cell_ptr(m, e).open = true
-            e += rand_step(m, e)
+            e += rand_step(m, e, dir, chance)
+            chance -= .05
+            n += 1
+            if n >= path_cap {
+                break
+            }
         }
     }
 
@@ -268,18 +286,20 @@ game_reset :: proc(g: ^Game) {
     
     sa.clear(&g.canon_path_indices)
 
+    path_caps := [Segment_Count]int {16, 16, 32, 32}
+
     p := Player_Spawn
     for seg_wall, i in g.segment_walls {
         start_of_path := true
         for p.y < seg_wall {
             // extra paths
-            if p.x < m.dims.x-3 && rand.float64() < 0.05 {
+            if p.x < m.dims.x-3 && rand.float64() < 0.03 {
                 maze_cell_ptr(m, p + {1, 0}).open = true
-                rand_path(m, p + {2, 0}, seg_wall-1)
+                rand_path(m, p + {2, 0}, seg_wall-1, 1, path_caps[i])
             }
-            if p.x > 3          && rand.float64() < 0.05 {
+            if p.x > 3          && rand.float64() < 0.03 {
                 maze_cell_ptr(m, p - {1, 0}).open = true
-                rand_path(m, p - {2, 0}, seg_wall-1)
+                rand_path(m, p - {2, 0}, seg_wall-1, -1, path_caps[i])
             }
 
             index := maze_cell_index(m, p)
@@ -288,7 +308,7 @@ game_reset :: proc(g: ^Game) {
             maze_cell_ptr(m, p).open = true
             sa.append(&g.canon_path_indices, index)
 
-            p += start_of_path ? {0, 1} : rand_step(m, p)
+            p += start_of_path ? {0, 1} : rand_step(m, p, 0, 0)
             for k, i in key_y_positions {
                 if p.y == k {
                     door_keys[i] = index
@@ -458,6 +478,7 @@ game_update_playing :: proc(g: ^Game) {
 
     g.player_cell_index = maze_cell_pos_index(m, g.player)
 
+
     player_cell := &m.cells[g.player_cell_index]
 
     if player_cell.has_key {
@@ -471,10 +492,20 @@ game_update_playing :: proc(g: ^Game) {
         }
     }
 
-    if moving && g.level == .Randomize {
+    if moving && g.level == .Randomize { // crazy random paths!!
+        g.cells_visited_indices[g.player_cell_index] = {}
+
+        if slice.contains(sa.slice(&g.canon_path_indices), g.player_cell_index) {
+            g.cells_visited_indices = {}
+        }
+
         ignore := make(map[int]struct{}, context.temp_allocator)
 
         for index in sa.slice(&g.canon_path_indices) {
+            ignore[index] = {}
+        }
+
+        for index in g.cells_visited_indices {
             ignore[index] = {}
         }
 
@@ -523,6 +554,7 @@ game_start_randomize :: proc(g: ^Game) {
     game_reset(g)
     g.level = .Randomize
     rl.SeekMusicStream(g.musics[.Randomize], rl.GetMusicTimePlayed(g.musics[.Normal]))
+    g.cells_visited_indices = {}
 }
 
 game_start_idol :: proc(g: ^Game) {
@@ -541,14 +573,20 @@ game_draw :: proc(g: ^Game) {
 
     if g.state == .Intro {
         draw_text(g, "Welcome to THE TEMPLE OF MISHMASH", 
-                     "Use Arrow Keys To Move",
+                     "For centuries, an ancient idol has been hidden here",
+                     "Each who enter has either never returned",
+                     "Or is now completely insane",
+                     "",
+                     "Use the Arrow Keys To Move",
+                     "Use WASD to Strafe",
                      "Press Enter To Begin")
     }
 
     if g.state == .Win {
         draw_text(g, "Congratulations!", 
                      "You found the idol and made it out",
-                     "Let's hope this ends up in a museum!")
+                     "Let's hope this ends up in a museum",
+                     "And let's hope your sanity is intact...")
     }
 }
 
@@ -651,6 +689,7 @@ game_draw_raycast :: proc(g: ^Game) {
     }
 
     Wall_Column :: struct {
+        texture: rl.Texture,
         z: f32,
         x, y0, y1: i32,
         source, dest: rl.Rectangle,
@@ -668,9 +707,11 @@ game_draw_raycast :: proc(g: ^Game) {
         y0 := half_screen_height - dy
         y1 := half_screen_height + dy
 
+        texture := g.wall_texture
         cell := col.hit_cell
         color := rl.BROWN
         if cell.is_door {
+            texture = g.door_texture
             color = door_rl_color(cell.color)
         }
 
@@ -692,9 +733,9 @@ game_draw_raycast :: proc(g: ^Game) {
             height = f32(y1-y0),
         }
 
-        rl.DrawTexturePro(g.wall_texture, source, dest, {}, 0, color)
+        rl.DrawTexturePro(texture, source, dest, {}, 0, color)
 
-        wall_cols[col_index] = {col.dist, x, y0, y1, source, dest, color}
+        wall_cols[col_index] = {texture, col.dist, x, y0, y1, source, dest, color}
     }
 
     { // draw keys
@@ -731,7 +772,6 @@ game_draw_raycast :: proc(g: ^Game) {
 
         texture, tex_scale := pickup_texture(g)
 
-
         for k in sa.slice(&keys) {
             scale := k.scale * tex_scale
             s := rl.GetWorldToScreenEx({k.pos.x, k.pos.y, 0}, camera, screen_width, screen_height)
@@ -763,7 +803,7 @@ game_draw_raycast :: proc(g: ^Game) {
             }
         }
         if draw {
-            rl.DrawTexturePro(g.wall_texture, c.source, c.dest, {}, 0, c.color)
+            rl.DrawTexturePro(c.texture, c.source, c.dest, {}, 0, c.color)
         }
     }
 }
@@ -906,19 +946,12 @@ get_raycast_results :: proc(g: ^Game) -> Raycast_Results {
 
 
 Maze :: struct {
-    cells: [Maze_Cell_Array_Size]Cell,
+    cells: [1<<16]Cell,
     dims: [2]int,
     cell_dims: [2]int,
 }
 
-Maze_Width :: 100
-
-//Min_Segment_Len :: 50
-Min_Segment_Len :: 10
-//Max_Segment_Len :: 100
-Max_Segment_Len :: 20
-
-Maze_Cell_Array_Size :: Maze_Width * (Max_Segment_Len+1) * Segment_Count
+Maze_Width :: 75
 
 Cell :: bit_field u8 {
     open:     bool | 1,
@@ -965,25 +998,21 @@ maze_cell_pos_index :: proc(maze: ^Maze, p: Vector2) -> int {
 
 
 draw_text :: proc(g: ^Game, titles: ..cstring) {
-    height :: 24
+    height :: Font_Size
     padding :: 5
+    spacing :: 2
+    Text_Color :: rl.Color {0xad, 0xdf, 0xff, 255}
+
     total_height := len(titles) * height
     total_height += (len(titles)-1) * padding
 
     y := screen_height/2 - total_height/2
 
-    total_width := 0
     for t in titles {
-        total_width = max(total_width, int(rl.MeasureText(t, height)))
-    }
-
-    x := screen_width/2 - total_width/2 
-    rl.DrawRectangle(i32(x), i32(y), i32(total_width), i32(total_height), rl.BROWN)
-
-    for t in titles {
-        width := int(rl.MeasureText(t, height))
+        dims := rl.MeasureTextEx(g.font, t, height, spacing)
+        width := int(dims.x)
         x := screen_width/2 - width/2
-        rl.DrawText(t, i32(x), i32(y), height, rl.RAYWHITE)
+        rl.DrawTextEx(g.font, t, {f32(x), f32(y)}, height, spacing, Text_Color)
         y += height + padding
     }
 }
