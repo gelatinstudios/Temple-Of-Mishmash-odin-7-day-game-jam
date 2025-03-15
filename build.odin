@@ -6,6 +6,7 @@ import "core:c/libc"
 RUN :: 1
 DEBUG :: 0
 SPEED :: 1
+NO_CONSOLE :: 1
 
 when RUN != 0 {
     cmd :: "run"
@@ -25,6 +26,12 @@ when SPEED != 0 {
     spd :: ""
 }
 
+when NO_CONSOLE != 0 {
+    sbs :: "-subsystem:windows"
+} else {
+    sbs :: ""
+}
+
 main :: proc() {
-    libc.system("odin "+cmd+" source "+spd+" "+dbg+" -out:game.exe")
+    libc.system("odin "+cmd+" source "+spd+" "+dbg+" -out:game.exe "+sbs)
 }

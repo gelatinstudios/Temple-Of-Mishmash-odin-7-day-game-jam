@@ -71,7 +71,7 @@ main :: proc() {
                           tint = rl.WHITE)
 
         when DEV {
-            rl.DrawFPS(5, 5)
+            //rl.DrawFPS(5, 5)
         }
 
         rl.EndDrawing()
@@ -577,16 +577,19 @@ game_draw :: proc(g: ^Game) {
                      "Each who enter has either never returned",
                      "Or is now completely insane",
                      "",
+                     "There are 2 sets of 4 colored doors",
+                     "",
                      "Use the Arrow Keys To Move",
                      "Use WASD to Strafe",
                      "Press Enter To Begin")
     }
 
     if g.state == .Win {
-        draw_text(g, "Congratulations!", 
-                     "You found the idol and made it out",
-                     "Let's hope this ends up in a museum",
-                     "And let's hope your sanity is intact...")
+        draw_text(g, "January 5, 1946", 
+                     "Authorities have taken into custody",
+                     "a tourist visiting Mixmaq Temple",
+                     "Reports say they've stolen an important artifact",
+                     "Their lawyer is claiming an insanity plea")
     }
 }
 
